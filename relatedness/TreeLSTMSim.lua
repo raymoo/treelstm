@@ -40,6 +40,8 @@ function TreeLSTMSim:__init(config)
     self.treelstm = treelstm.ChildSumTreeLSTM(treelstm_config)
   elseif self.structure == 'constituency' then
     self.treelstm = treelstm.BinaryTreeLSTM(treelstm_config)
+  elseif self.structure == 'doublelstm' then
+    self.treelstm = treelstm.InnerLSTMTreeLSTM(treelstm_config)
   else
     error('invalid parse tree type: ' .. self.structure)
   end

@@ -16,7 +16,7 @@ end
 -- read command line arguments
 local args = lapp [[
 Training script for semantic relatedness prediction on the SICK dataset.
-  -m,--model  (default dependency) Model architecture: [dependency, constituency, lstm, bilstm]
+  -m,--model  (default dependency) Model architecture: [dependency, constituency, lstm, bilstm, doublelstm]
   -l,--layers (default 1)          Number of layers (ignored for Tree-LSTM)
   -d,--dim    (default 150)        LSTM memory dimension
   -e,--epochs (default 10)         Number of training epochs
@@ -35,6 +35,9 @@ elseif args.model == 'lstm' then
 elseif args.model == 'bilstm' then
   model_name = 'Bidirectional LSTM'
   model_class = treelstm.LSTMSim
+elseif args.model == 'doublelstm' then
+  model_name = 'Inner LSTM Tree LSTM'
+  model_class = treelstm.TreeLSTMSim
 end
 local model_structure = args.model
 header(model_name .. ' for Semantic Relatedness')

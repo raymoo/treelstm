@@ -1,6 +1,6 @@
 --[[
 
-  A Tree-LSTM that uses a LSTM to combine child states.
+  A Tree-LSTM that uses an LSTM to combine inputs
 
 --]]
 
@@ -8,70 +8,42 @@ local InnerLSTMTreeLSTM, parent = torch.class('treelstm.InnerLSTMTreeLSTM', 'tre
 
 function InnerLSTMTreeLSTM:__init(config)
   parent.__init(self, config)
-  self.gate_output = config.gate_output
+  self.gat_output = config.gate_output
   if self.gate_output == nil then self.gate_output = true end
 
-  -- a function that instantiates an output module that takes the hidden state h as input
-  self.output_module_fn = config.output_module_fn
   self.criterion = config.criterion
 
-  -- composition module
   self.composer = self:new_composer()
   self.composers = {}
 
-  -- output module
   self.output_module = self:new_output_module()
   self.output_modules = {}
 end
 
+-- Input: {in_dim, child_count (table) x 1 x mem_dim}
+-- Output: 1 x mem_dim
 function InnerLSTMTreeLSTM:new_composer()
-  local input = nn.Identity()()
-  local child_c = nn.Identity()()
-  local child_h = nn.Identity()()
-  local child_h_sum = nn.Sum(1)(child_h)
+  local input = nn.View(1, 1, self.in_dim)() -- 1 x 1 x in_dim
+  local child_h = nn.Unsqueeze(2)(nn.JoinTable(1)()) -- child_count x 1 x mem_dim
 
-  local i = nn.Sigmoid()(
-    nn.CAddTable(){
-      nn.Linear(self.in_dim, self.mem_dim)(input),
-      nn.Linear(self.mem_dim, self.mem_dim)(child_h_sum)
-    })
-  local f = nn.Sigmoid()(
-    treelstm.CRowAddTable(){
-      nn.TemporalConvolution(self.mem_dim, self.mem_dim, 1)(child_h),
-      nn.Linear(self.in_dim, self.mem_dim)(input),
-    })
-  local update = nn.Tanh()(
-    nn.CAddTable(){
-      nn.Linear(self.in_dim, self.mem_dim)(input),
-      nn.Linear(self.mem_dim, self.mem_dim)(child_h_sum)
-    })
-  local c = nn.CAddTable(){
-      nn.CMulTable(){i, update},
-      nn.Sum(1)(nn.CMulTable(){f, child_c})
-    }
+  -- child_count x 1 x (in_dim + mem_dim) -> child_count x 1 x mem_dim
+  local seqblstm = nn.SeqLSTM(self.in_dim + self.mem_dim, self.mem_dim, self.mem_dim)
 
-  local h
-  if self.gate_output then
-    local o = nn.Sigmoid()(
-      nn.CAddTable(){
-        nn.Linear(self.in_dim, self.mem_dim)(input),
-        nn.Linear(self.mem_dim, self.mem_dim)(child_h_sum)
-      })
-    h = nn.CMulTable(){o, nn.Tanh()(c)}
-  else
-    h = nn.Tanh()(c)
-  end
-
-  local composer = nn.gModule({input, child_c, child_h}, {c, h})
+  local h = nn.Squeeze(2)(seqblstm(nn.JoinTable(3)({input, child_h})))
+  
+  local composer = nn.gModule({input, child_h}, {h});
   if self.composer ~= nil then
     share_params(composer, self.composer)
   end
+
   return composer
 end
 
-function InnerLSTMTreeLSTM:new_output_module()
-  if self.output_module_fn == nil then return nil end
-  local output_module = self.output_module_fn()
+-- Input: mem_dim
+-- Output: out_dim
+function InnerLSTMTreeLSTM:new_output_module(output_fn)
+  if output_fn == nil then return nil end
+  local output_module = output_fn()
   if self.output_module ~= nil then
     share_params(output_module, self.output_module)
   end
@@ -80,87 +52,22 @@ end
 
 function InnerLSTMTreeLSTM:forward(tree, inputs)
   local loss = 0
+  local child_h = {}
   for i = 1, tree.num_children do
-    local _, child_loss = self:forward(tree.children[i], inputs)
+    local one_h, child_loss = self:forward(tree.children[i], inputs)
+    child_h[i] = one_h
     loss = loss + child_loss
   end
-  local child_c, child_h = self:get_child_states(tree)
-  self:allocate_module(tree, 'composer')
-  tree.state = tree.composer:forward{inputs[tree.idx], child_c, child_h}
 
+  self:allocate_module(tree, 'composer')
+  local h = unpack(tree.composer:forward({inputs[tree.idx], child_h}))
+  
   if self.output_module ~= nil then
     self:allocate_module(tree, 'output_module')
-    tree.output = tree.output_module:forward(tree.state[2])
+    tree.output = tree.output_module:forward(h)
     if self.train and tree.gold_label ~= nil then
-      loss = loss + self.criterion:forward(tree.output, tree.gold_label)
+      loss = loss + self.criterion:forward(output, tree.gold_label)
     end
   end
-  return tree.state, loss
-end
-
-function InnerLSTMTreeLSTM:backward(tree, inputs, grad)
-  local grad_inputs = torch.Tensor(inputs:size())
-  self:_backward(tree, inputs, grad, grad_inputs)
-  return grad_inputs
-end
-
-function InnerLSTMTreeLSTM:_backward(tree, inputs, grad, grad_inputs)
-  local output_grad = self.mem_zeros
-  if tree.output ~= nil and tree.gold_label ~= nil then
-    output_grad = tree.output_module:backward(
-      tree.state[2], self.criterion:backward(tree.output, tree.gold_label))
-  end
-  self:free_module(tree, 'output_module')
-  tree.output = nil
-
-  local child_c, child_h = self:get_child_states(tree)
-  local composer_grad = tree.composer:backward(
-    {inputs[tree.idx], child_c, child_h},
-    {grad[1], grad[2] + output_grad})
-  self:free_module(tree, 'composer')
-  tree.state = nil
-
-  grad_inputs[tree.idx] = composer_grad[1]
-  local child_c_grads, child_h_grads = composer_grad[2], composer_grad[3]
-  for i = 1, tree.num_children do
-    self:_backward(tree.children[i], inputs, {child_c_grads[i], child_h_grads[i]}, grad_inputs)
-  end
-end
-
-function InnerLSTMTreeLSTM:clean(tree)
-  self:free_module(tree, 'composer')
-  self:free_module(tree, 'output_module')
-  tree.state = nil
-  tree.output = nil
-  for i = 1, tree.num_children do
-    self:clean(tree.children[i])
-  end
-end
-
-function InnerLSTMTreeLSTM:parameters()
-  local params, grad_params = {}, {}
-  local cp, cg = self.composer:parameters()
-  tablex.insertvalues(params, cp)
-  tablex.insertvalues(grad_params, cg)
-  if self.output_module ~= nil then
-    local op, og = self.output_module:parameters()
-    tablex.insertvalues(params, op)
-    tablex.insertvalues(grad_params, og)
-  end
-  return params, grad_params
-end
-
-function InnerLSTMTreeLSTM:get_child_states(tree)
-  local child_c, child_h
-  if tree.num_children == 0 then
-    child_c = torch.zeros(1, self.mem_dim)
-    child_h = torch.zeros(1, self.mem_dim)
-  else
-    child_c = torch.Tensor(tree.num_children, self.mem_dim)
-    child_h = torch.Tensor(tree.num_children, self.mem_dim)
-    for i = 1, tree.num_children do
-       child_c[i], child_h[i] = unpack(tree.children[i].state)
-    end
-  end
-  return child_c, child_h
+  return h, loss
 end
