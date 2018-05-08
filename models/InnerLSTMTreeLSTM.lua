@@ -30,7 +30,10 @@ function InnerLSTMTreeLSTM:new_composer()
   local child_h = nn.Identity()()
   local child_h_sum = nn.Sum(1)(child_h)
 
-  local seqblstm = nn.SeqLSTM(self.in_dim + self.mem_dim, self.mem_dim, self.mem_dim)
+  -- TODO: take input into RNN also
+  local seqblstm = nn.SeqBGRU(self.mem_dim, self.mem_dim)
+  local lstm_input = nn.Unsqueeze(2)(child_h)
+  local lstm_h = nn.Tanh()(nn.Squeeze(2)(seqblstm(lstm_input)))
 
   local i = nn.Sigmoid()(
     nn.CAddTable(){
@@ -39,7 +42,7 @@ function InnerLSTMTreeLSTM:new_composer()
     })
   local f = nn.Sigmoid()(
     treelstm.CRowAddTable(){
-      nn.TemporalConvolution(self.mem_dim, self.mem_dim, 1)(child_h),
+      nn.TemporalConvolution(self.mem_dim, self.mem_dim, 1)(lstm_h),
       nn.Linear(self.in_dim, self.mem_dim)(input),
     })
   local update = nn.Tanh()(
